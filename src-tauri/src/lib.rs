@@ -23,9 +23,10 @@ async fn open_document(app: tauri::AppHandle) -> Result<OpenResult, String> {
         .file()
         .add_filter("Markdown", &["md", "markdown", "txt"])
         .blocking_pick_file();
-    let Some(path) = file else {
+    let Some(file) = file else {
         return Err("cancelled".into());
     };
+    let path = file.into_path().map_err(|e| e.to_string())?;
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     Ok(OpenResult {
         path: path.display().to_string(),
@@ -53,7 +54,7 @@ async fn save_document(
             let Some(fp) = file else {
                 return Err("cancelled".into());
             };
-            let mut p = fp.as_path().to_path_buf();
+            let mut p = fp.into_path().map_err(|e| e.to_string())?;
             if p.extension().is_none() {
                 p.set_extension("md");
             }
@@ -79,6 +80,7 @@ async fn import_image(
     let Some(src) = file else {
         return Err("cancelled".into());
     };
+    let src = src.into_path().map_err(|e| e.to_string())?;
 
     let doc = Path::new(&document_path);
     let assets_dir = doc
