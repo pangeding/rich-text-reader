@@ -284,6 +284,17 @@ body {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.modal-message {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.modal-actions button.danger {
+  color: #cf222e;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

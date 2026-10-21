@@ -1,13 +1,15 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { Markdown } from "@tiptap/markdown";
 import Placeholder from "@tiptap/extension-placeholder";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { RichImage, imageBaseDir } from "./extensions/image";
 import Toolbar from "./components/Toolbar";
 import StatusBar from "./components/StatusBar";
 import LinkModal from "./components/LinkModal";
+import ConfirmDialog, { type UnsavedChoice } from "./components/ConfirmDialog";
 import "./App.css";
 
 interface OpenResult {
@@ -41,10 +43,32 @@ function App() {
     open: false,
     url: "",
   });
+  const [confirmMessage, setConfirmMessage] = useState<string | null>(null);
 
   const suppressDirty = useRef(false);
   const docPathRef = useRef<string | null>(null);
+  const dirtyRef = useRef(false);
+  const confirmResolver = useRef<((choice: UnsavedChoice) => void) | null>(null);
   docPathRef.current = docPath;
+
+  const setDirtyState = useCallback((value: boolean) => {
+    dirtyRef.current = value;
+    setDirty(value);
+  }, []);
+
+  const askUnsaved = useCallback(() => {
+    setConfirmMessage("当前文档有未保存的修改，是否保存？");
+    return new Promise<UnsavedChoice>((resolve) => {
+      confirmResolver.current = resolve;
+    });
+  }, []);
+
+  const resolveConfirm = useCallback((choice: UnsavedChoice) => {
+    setConfirmMessage(null);
+    const resolve = confirmResolver.current;
+    confirmResolver.current = null;
+    resolve?.(choice);
+  }, []);
 
   const editor = useEditor({
     extensions: [
@@ -60,43 +84,56 @@ function App() {
     autofocus: false,
     onUpdate: ({ editor: e }) => {
       setWordCount(e.getText().replace(/\s/g, "").length);
-      if (!suppressDirty.current) setDirty(true);
+      if (!suppressDirty.current) setDirtyState(true);
     },
   });
 
-  const setDocument = useCallback((path: string) => {
-    docPathRef.current = path;
-    imageBaseDir.current = dirname(path);
-    setDocPath(path);
-    setDirty(false);
-  }, []);
+  const setDocument = useCallback(
+    (path: string) => {
+      docPathRef.current = path;
+      imageBaseDir.current = dirname(path);
+      setDocPath(path);
+      setDirtyState(false);
+    },
+    [setDirtyState],
+  );
 
-  const handleOpen = useCallback(async () => {
-    try {
-      const res = await invoke<OpenResult>("open_document");
-      if (!editor) return;
-      suppressDirty.current = true;
-      editor.commands.setContent(res.content, { contentType: "markdown" });
-      suppressDirty.current = false;
-      setDocument(res.path);
-      setWordCount(editor.getText().replace(/\s/g, "").length);
-    } catch (e) {
-      if (e !== "cancelled") setBanner(String(e));
-    }
-  }, [editor, setDocument]);
-
-  const handleSave = useCallback(async () => {
-    if (!editor) return;
+  const handleSave = useCallback(async (): Promise<boolean> => {
+    if (!editor) return false;
     try {
       const savedPath = await invoke<string>("save_document", {
         path: docPathRef.current,
         content: editor.getMarkdown(),
       });
       setDocument(savedPath);
+      return true;
+    } catch (e) {
+      if (e !== "cancelled") setBanner(String(e));
+      return false;
+    }
+  }, [editor, setDocument]);
+
+  const handleOpen = useCallback(async () => {
+    if (!editor) return;
+    if (dirtyRef.current) {
+      const choice = await askUnsaved();
+      if (choice === "cancel") return;
+      if (choice === "save" && !(await handleSave())) return;
+    }
+    try {
+      const res = await invoke<OpenResult>("open_document");
+      suppressDirty.current = true;
+      try {
+        editor.commands.setContent(res.content, { contentType: "markdown" });
+      } finally {
+        suppressDirty.current = false;
+      }
+      setDocument(res.path);
+      setWordCount(editor.getText().replace(/\s/g, "").length);
     } catch (e) {
       if (e !== "cancelled") setBanner(String(e));
     }
-  }, [editor, setDocument]);
+  }, [editor, askUnsaved, handleSave, setDocument]);
 
   const handleSaveAs = useCallback(async () => {
     if (!editor) return;
@@ -125,11 +162,11 @@ function App() {
         .focus()
         .setImage({ src: res.relative_path, alt: res.file_name })
         .run();
-      setDirty(true);
+      setDirtyState(true);
     } catch (e) {
       if (e !== "cancelled") setBanner(String(e));
     }
-  }, [editor]);
+  }, [editor, setDirtyState]);
 
   const handleLink = useCallback(() => {
     if (!editor) return;
@@ -147,10 +184,42 @@ function App() {
       } else {
         editor.chain().focus().extendMarkRange("link").unsetLink().run();
       }
-      setDirty(true);
+      setDirtyState(true);
     },
-    [editor],
+    [editor, setDirtyState],
   );
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    let closing = false;
+
+    appWindow
+      .onCloseRequested(async (event) => {
+        if (closing) return;
+        if (!dirtyRef.current) return;
+        event.preventDefault();
+        if (confirmResolver.current) return;
+
+        const choice = await askUnsaved();
+        if (choice === "cancel") return;
+        if (choice === "save" && !(await handleSave())) return;
+
+        closing = true;
+        await appWindow.destroy();
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => setBanner(String(e)));
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [askUnsaved, handleSave]);
 
   if (!editor) return null;
 
@@ -178,6 +247,11 @@ function App() {
         initialUrl={linkModal.url}
         onCancel={() => setLinkModal({ open: false, url: "" })}
         onConfirm={applyLink}
+      />
+      <ConfirmDialog
+        open={confirmMessage !== null}
+        message={confirmMessage ?? ""}
+        onChoice={resolveConfirm}
       />
     </div>
   );
